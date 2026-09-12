@@ -1,0 +1,13 @@
+# Gate 1 LMCache 配置：仅本地磁盘后端（不开 CPU RAM 层）
+# 设计依据：
+#  - 磁盘后端在 worker 进程重启后仍存活 -> 可制造"GPU 本地 miss + 外部命中"
+#  - 单一后端保证命中来源可归因（不混合 CPU/DISK 两层）
+#  - chunk_size 256：8192-token prefix = 32 个完整 chunk，精确对齐
+# 字段名与 lmcache 0.5.4 LMCacheEngineConfig dataclass 一一对应（2026-09-09 实测打印）
+chunk_size: 256
+local_cpu: false
+max_local_cpu_size: 0.0
+local_disk: /root/autodl-tmp/lmcache_disk_gate1
+max_local_disk_size: 2.0
+save_decode_cache: false
+enable_blending: false

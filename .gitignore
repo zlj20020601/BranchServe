@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+artifacts/*.jsonl
+artifacts/*.json
+artifacts/*.zip
+artifacts/*/
+logs/
+*.pid
+*.stdout
+*.stderr
