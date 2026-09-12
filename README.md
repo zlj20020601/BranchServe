@@ -174,3 +174,100 @@ bash scripts/start_workers.sh configs/4090-qwen35-4b.env.example
 bash scripts/check_workers.sh configs/4090-qwen35-4b.env.example
 python multiround_pressure.py --strategy dynamic --pressure 6 --rounds 4 --initial-tokens 8192 --append-tokens 2048 --fanout 4 --child-max-tokens 256 --out artifacts/multiround_dynamic.json
 ```
+## 项目故事：为什么需要 BranchServe
+
+长上下文 Agent 经常先处理一个 Parent 任务，再从同一段历史上下文派生多个 Child 分支。例如，一个长会议、代码仓库或工具调用历史先被 Parent 读取，随后多个 Child 分别回答不同问题。Child 之间共享很长的 prefix，但分支内容和生成结果不同。
+
+这带来一个直接冲突：
+
+```text
+留在 Parent 所在 GPU：可以复用本地 Prefix Cache，但多个 Child 会排队；
+迁移到另一张 GPU：可以并行执行，但需要 Retrieve KV，或者重新计算长 prefix。
+```
+
+BranchServe 的问题不是“如何把请求平均分给 GPU”，而是：
+
+> 在当前 worker pressure、prefix cache 状态和 KV 传输成本下，这一组 Child 应该 PACK、Retrieve 还是 Recompute？
+
+## 我们的核心假设
+
+- 共享 prefix 越长，重复 Recompute 越昂贵；
+- Parent worker 越繁忙，PACK 的排队成本越高；
+- 另一张 GPU 空闲且 KV 可用时，Retrieve 可以同时获得 prefix 复用和并行收益；
+- 因此最优策略可能随 pressure 变化，而不是固定不变。
+
+## 系统如何工作
+
+1. Parent 在一个 vLLM worker 上处理长上下文；
+2. LMCache 保存已经计算出的 KV；
+3. Parent 派生一组 Child，BranchServe Router 将整组 Child 作为一个调度单元；
+4. Router 读取两个 worker 的 running/waiting pressure 和 cache 状态；
+5. Router 选择 PACK、Retrieve 或 Recompute；
+6. 所有 Child 完成后记录 group makespan、KV 来源和策略 regret。
+
+LMCache 在这里不是“把文本放到 CPU”，而是提供 KV 的保存和复用路径。KV 可能命中 GPU 本地 Prefix Cache，也可能通过 LMCache 跨 Worker Retrieve；如果 cache 不可用，则进入 Recompute。实验记录 `local_compute`、`local_cache_hit` 和 `external_kv_transfer` 三类来源，避免把缓存读取误当成零成本。
+
+## 实验路线
+
+项目按由底到顶的顺序推进：
+
+1. **基础路径**：验证单 Worker、Prefix Cache 和 LMCache 存取；
+2. **跨 Worker 路径**：验证 Retrieve、Recompute、KV transfer 和状态一致性；
+3. **真实任务**：在 LongBench QMSum 上比较三种策略的延迟和回答指标；
+4. **系统压力**：在 Mooncake Tool/Agent trace 上完成 431/431 正式重放；
+5. **多轮调度**：固定 8K 初始上下文、每轮增加 2K、4 轮 fan-out，在 pressure=0/2/4/6/8 下验证 Dynamic。
+
+## 最重要的结果
+
+### 三策略正式基线
+
+Mooncake 431 条可执行轨迹全部完成：
+
+| 策略 | 总耗时 |
+|---|---:|
+| PACK | 838.16 s |
+| Retrieve | 770.38 s |
+| Recompute | 901.94 s |
+
+Retrieve 比 PACK 快约 8.8%，比 Recompute 快约 14.6%。该结果采用 Parent 已存在后的 Child 调度口径；Parent 写入成本单独记录，不将两种口径混淆。
+
+### 真实文本任务
+
+QMSum 19 份会议、76 个问题、456 份回答：
+
+| 策略 | 平均整组耗时 | ROUGE-L |
+|---|---:|---:|
+| PACK | 1.710 s | 21.885 |
+| Retrieve | 1.647 s | 21.889 |
+| Recompute | 2.446 s | 22.158 |
+
+Retrieve 比 PACK 快约 3.7%，比 Recompute 快约 32.7%。三种策略输出质量接近；ROUGE-L 只作为词面指标，不代表事实正确率。
+
+### 多轮 pressure crossover
+
+在 4 轮、8K 初始上下文、每轮增加 2K 的协议下：
+
+```text
+pressure 0/2/4：Dynamic → PACK
+pressure 6/8：Dynamic → Retrieve
+```
+
+这说明当前双 GPU 长上下文 fan-out 场景存在清晰的 pressure crossover：低压力时本地复用更划算，高压力时跨 Worker Retrieve 的并行收益更大。Recompute 在当前实验范围内通常最慢。
+
+## 结论边界
+
+我们证明的是一个限定但可复现的命题：
+
+> 在双 GPU、Qwen3.5-4B、长共享 prefix 和固定 fan-out 的场景中，最优放置取决于 worker pressure；Dynamic 可以在低压力选择 PACK，在高压力选择 Retrieve。
+
+我们没有声称 Retrieve 在所有模型、上下文长度、GPU 数量和负载下都最优，也没有把 Mooncake hash replay 当作语义质量评测。32K/64K 上下文、多 Parent、多级 DAG 和更大集群属于后续扩展。
+
+## 如何阅读本仓库
+
+- 先读本文的项目故事和结果；
+- 再看 `core/` 理解 Router、策略和 telemetry；
+- 看 `experiments/` 了解多轮和 pressure 协议；
+- 看 `analysis/` 复现汇总和 oracle/regret；
+- 看 `validation/` 了解 Gate1/Gate2/Gate3 路径验证；
+- 看 `deployment/` 了解 vLLM、LMCache 和服务启动方式；
+- 看 `docs/` 阅读阶段报告和实验限制。
