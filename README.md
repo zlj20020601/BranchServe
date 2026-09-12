@@ -36,21 +36,40 @@ RECOMPUTE 动作借用 vLLM 请求级 `cache_salt`(缓存盐)实现:cache_salt �
 ## 仓库结构
 
 ```text
-branchserve/
-├── multiround_strategy.py     # 多轮三策略 runner(零压力;store 观察器;三源归因)
-├── multiround_pressure.py     # 压力分层 runner(背景负载/屏障/三动作/dynamic 路由)
-├── salt_verify.py             # cache_salt 机制验证
-├── analyze_upressure.py       # 压力交叉表与最优判定
-├── analyze_dynamic.py         # dynamic regret(vs 固定最优/逐轮 oracle,含稳态列)
-├── router.py / models.py / metrics.py / cost_model.py   # 路由器、数据结构、指标读取、成本模型
-├── pressure_sweep.py / pressure_crossover.py / multi_workflow.py   # 早期两策略压力实验
-├── gate1_single_worker.py / gate2_cross_worker.py 等    # LMCache 单机/跨卡验证脚本
-├── replay_mooncake_*.py / prepare_mooncake_trace.py     # Mooncake 轨迹回放与筛选
-├── start_worker.sh / start_mooncake_connector_stack.py  # 栈启动
-├── run_repeats.sh / rerun_dynamic.sh                    # 重复实验与受控重跑驱动
-├── artifacts/                  # 全部实验产物(JSON,含逐轮明细与指标差分)
-└── logs/                       # worker 与 lmcache server 运行日志
+BranchServe/
+├── core/                         # 调度器核心：Router、策略、KV/pressure metrics、数据结构
+│   ├── router.py
+│   ├── policies.py
+│   ├── cost_model.py
+│   ├── metrics.py
+│   └── models.py
+├── experiments/                  # 实验入口与 workload runner
+│   ├── multiround_strategy.py    # 多轮三策略 runner
+│   ├── multiround_pressure.py    # pressure/barrier/三动作/Dynamic
+│   ├── multi_workflow.py         # Parent/Child fan-out workflow
+│   ├── pressure_sweep.py         # 压力扫描
+│   ├── prepare_mooncake_trace.py # Mooncake 轨迹准备
+│   ├── replay_mooncake_*.py      # Mooncake 回放
+│   └── prepare_qmsum.py          # QMSum 数据准备
+├── analysis/                     # 汇总、对比和 oracle/regret 分析
+│   ├── analyze_upressure.py
+│   ├── analyze_dynamic.py
+│   └── summarize_*.py
+├── validation/                   # Gate1/Gate2/Gate3 路径验证与测试
+│   ├── gate1_single_worker.py
+│   ├── gate2_*.py
+│   ├── gate3_*.py
+│   └── test_*.py
+├── deployment/                   # vLLM、LMCache、Router 启动与服务脚本
+│   ├── branchserve_service.py
+│   ├── start_worker.sh
+│   └── start_mooncake_connector_stack.py
+├── docs/                         # 阶段报告、实验协议和项目结论
+├── README.md                     # 项目说明、结果和复现入口
+└── .gitignore                    # 排除日志、模型、原始数据和运行产物
 ```
+
+实验运行产生的 `artifacts/`、`logs/`、模型和原始数据保留在实验服务器，不提交到公开仓库。
 
 ## 环境要求
 
