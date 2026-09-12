@@ -71,55 +71,6 @@ BranchServe/
 
 实验运行产生的 `artifacts/`、`logs/`、模型和原始数据保留在实验服务器，不提交到公开仓库。
 
-## 环境要求
-
-- 2×GPU(实测 RTX 4090 24G);驱动与 CUDA 支持torch 2.11 + vllm 0.26.0
-- conda 环境:python 3.12 / torch 2.11.0+cu130 / vllm 0.26.0 / lmcache 0.5.4 / transformers
-- 模型:Qwen3.5-4B(混合注意力+Mamba 架构;LMCache 走 lmcache 0.5.4 的 LMCacheMPConnector 外部模块路径,vLLM 自带 connector 不支持该混合架构)
-- 主机内存 ≥ 110GB(lmcache server L1=100GB 会被 pin)
-
-## 复现
-
-以仓库内路径为例(实验机为 2×4090 容器,模型与 conda 环境路径按实际修改):
-
-```bash
-# 1. 启动 lmcache server 与统一栈(双 connector worker)
-bash start_mooncake_connector_stack.py 所在环境执行:
-  lmcache server --host 127.0.0.1 --port 5555 --chunk-size 528 \
-    --separate-object-groups --l1-size-gb 100 --eviction-policy LRU
-  python start_mooncake_connector_stack.py   # 起 :8000/:8001 并等待健康
-
-# 2. 验证 RECOMPUTE 的 salt 机制(可选)
-python salt_verify.py
-
-# 3. 压力矩阵(每格一个独立 label,天然隔离,无需重启 worker)
-python multiround_pressure.py --strategy pack      --pressure 6 --label exp-pack-p6
-python multiround_pressure.py --strategy retrieve  --pressure 6 --label exp-retr-p6 \
-  --server-log logs/<server日志>
-python multiround_pressure.py --strategy recompute --pressure 6 --label exp-reco-p6
-python multiround_pressure.py --strategy dynamic   --pressure 6 --label exp-dyn-p6 \
-  --dynamic-threshold 5 --server-log logs/<server日志>
-
-# 4. 汇总
-python analyze_upressure.py    # 交叉表
-python analyze_dynamic.py      # dynamic regret
-```
-
-配置均以命令行参数提供(压力、轮数、前缀长度、fan-out、阈值、label、salt),可在不改代码的情况下扩展到其他网格。
-
-## 测量口径与限制
-
-- 比较单位为 child 组完成时间(4 个子请求并发,首末包络);parent 阶段在各动作间同构,不计入组时间。
-- 归因依据 vLLM `prompt_tokens_by_source_total` 三源差分(local_compute / local_cache_hit / external_kv_transfer),逐 worker 逐轮记录;APC 命中按块对齐(如 8221 tokens 实际命中 7920)。
-- 背景压力为纯解码负载(锚定会话首轮前缀,APC 热命中),真实 Agent 混合负载下 PACK 的恶化斜率可能更陡。
-- 每格 n=1(重复实验驱动 `run_repeats.sh`);噪声带约 ±100ms,与低压力端动作间差距同量级,正式引用应以多次重复的均值±标准差为准。
-- 观察到的 LMCache 工程问题(与本项目结论独立):lmcache 0.5.4 的 lmcache server 在持续"只写不读"流量下会出现传输路径 CUDA 错误并静默失效(子请求查不到即本地重算,无报错);受控实验排除了容量耗尽、驱逐失效、GPU 显存争抢三种解释,存取配套的流量(retrieve 类)在同等规模下未复现。本项目的 dynamic 路由以 transfer=0 为信号自动降级 RECOMPUTE,已实测生效。
-
-## 已验证能力边界
-
-- 单机双 GPU、单模型(Qwen3.5-4B)、16K 上下文内的结论;多机、更大上下文、其他模型未测不声称。
-- Dynamic 为阈值规则(非学习型成本模型);成本模型重拟合使用本表数据(36ms/压力单位),未做跨负载泛化验证。
-
 ## 项目背景
 
 BranchServe 面向双 GPU 长上下文 Agent fan-out 推理。一个 Parent 请求会派生多个共享长 prefix 的 Child 请求。系统需要在本地 Prefix Cache 复用和跨 GPU 并行之间选择执行位置。
@@ -174,6 +125,55 @@ bash scripts/start_workers.sh configs/4090-qwen35-4b.env.example
 bash scripts/check_workers.sh configs/4090-qwen35-4b.env.example
 python multiround_pressure.py --strategy dynamic --pressure 6 --rounds 4 --initial-tokens 8192 --append-tokens 2048 --fanout 4 --child-max-tokens 256 --out artifacts/multiround_dynamic.json
 ```
+## 环境要求
+
+- 2×GPU(实测 RTX 4090 24G);驱动与 CUDA 支持torch 2.11 + vllm 0.26.0
+- conda 环境:python 3.12 / torch 2.11.0+cu130 / vllm 0.26.0 / lmcache 0.5.4 / transformers
+- 模型:Qwen3.5-4B(混合注意力+Mamba 架构;LMCache 走 lmcache 0.5.4 的 LMCacheMPConnector 外部模块路径,vLLM 自带 connector 不支持该混合架构)
+- 主机内存 ≥ 110GB(lmcache server L1=100GB 会被 pin)
+
+## 复现
+
+以仓库内路径为例(实验机为 2×4090 容器,模型与 conda 环境路径按实际修改):
+
+```bash
+# 1. 启动 lmcache server 与统一栈(双 connector worker)
+bash start_mooncake_connector_stack.py 所在环境执行:
+  lmcache server --host 127.0.0.1 --port 5555 --chunk-size 528 \
+    --separate-object-groups --l1-size-gb 100 --eviction-policy LRU
+  python start_mooncake_connector_stack.py   # 起 :8000/:8001 并等待健康
+
+# 2. 验证 RECOMPUTE 的 salt 机制(可选)
+python salt_verify.py
+
+# 3. 压力矩阵(每格一个独立 label,天然隔离,无需重启 worker)
+python multiround_pressure.py --strategy pack      --pressure 6 --label exp-pack-p6
+python multiround_pressure.py --strategy retrieve  --pressure 6 --label exp-retr-p6 \
+  --server-log logs/<server日志>
+python multiround_pressure.py --strategy recompute --pressure 6 --label exp-reco-p6
+python multiround_pressure.py --strategy dynamic   --pressure 6 --label exp-dyn-p6 \
+  --dynamic-threshold 5 --server-log logs/<server日志>
+
+# 4. 汇总
+python analyze_upressure.py    # 交叉表
+python analyze_dynamic.py      # dynamic regret
+```
+
+配置均以命令行参数提供(压力、轮数、前缀长度、fan-out、阈值、label、salt),可在不改代码的情况下扩展到其他网格。
+
+## 测量口径与限制
+
+- 比较单位为 child 组完成时间(4 个子请求并发,首末包络);parent 阶段在各动作间同构,不计入组时间。
+- 归因依据 vLLM `prompt_tokens_by_source_total` 三源差分(local_compute / local_cache_hit / external_kv_transfer),逐 worker 逐轮记录;APC 命中按块对齐(如 8221 tokens 实际命中 7920)。
+- 背景压力为纯解码负载(锚定会话首轮前缀,APC 热命中),真实 Agent 混合负载下 PACK 的恶化斜率可能更陡。
+- 每格 n=1(重复实验驱动 `run_repeats.sh`);噪声带约 ±100ms,与低压力端动作间差距同量级,正式引用应以多次重复的均值±标准差为准。
+- 观察到的 LMCache 工程问题(与本项目结论独立):lmcache 0.5.4 的 lmcache server 在持续"只写不读"流量下会出现传输路径 CUDA 错误并静默失效(子请求查不到即本地重算,无报错);受控实验排除了容量耗尽、驱逐失效、GPU 显存争抢三种解释,存取配套的流量(retrieve 类)在同等规模下未复现。本项目的 dynamic 路由以 transfer=0 为信号自动降级 RECOMPUTE,已实测生效。
+
+## 已验证能力边界
+
+- 单机双 GPU、单模型(Qwen3.5-4B)、16K 上下文内的结论;多机、更大上下文、其他模型未测不声称。
+- Dynamic 为阈值规则(非学习型成本模型);成本模型重拟合使用本表数据(36ms/压力单位),未做跨负载泛化验证。
+
 ## 项目故事：为什么需要 BranchServe
 
 长上下文 Agent 经常先处理一个 Parent 任务，再从同一段历史上下文派生多个 Child 分支。例如，一个长会议、代码仓库或工具调用历史先被 Parent 读取，随后多个 Child 分别回答不同问题。Child 之间共享很长的 prefix，但分支内容和生成结果不同。
