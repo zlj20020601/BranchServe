@@ -1,4 +1,11 @@
-"""Start the two-GPU LMCache connector stack with list-based argv quoting."""
+"""Start an N-GPU LMCache connector stack with list-based argv quoting.
+
+Set ``GPU_IDS`` and ``WORKER_PORTS`` as comma-separated lists, for example
+``GPU_IDS=0,1,2 WORKER_PORTS=8000,8001,8002 python ...``.  The first worker is
+the default parent worker; the remaining workers are available for retrieval
+or recomputation.
+"""
+import argparse
 import json
 import os
 from pathlib import Path
@@ -18,7 +25,11 @@ CONNECTOR = {
 }
 
 
-def current_workers():
+def parse_csv(value, cast=str):
+    return [cast(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def current_workers(ports):
     found = []
     for entry in Path("/proc").iterdir():
         if not entry.name.isdigit():
@@ -31,7 +42,7 @@ def current_workers():
         if "vllm" not in " ".join(decoded) or "--port" not in decoded:
             continue
         port = decoded[decoded.index("--port") + 1]
-        if port in {"8000", "8001"}:
+        if port in {str(item) for item in ports}:
             found.append((int(entry.name), port))
     return found
 
@@ -45,17 +56,29 @@ def health(port):
 
 
 def main():
-    for pid, _ in current_workers():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gpu-ids", default=os.environ.get("GPU_IDS", "0,1"),
+                    help="comma-separated physical GPU ids")
+    ap.add_argument("--worker-ports", default=os.environ.get("WORKER_PORTS", "8000,8001"),
+                    help="comma-separated worker ports")
+    args = ap.parse_args()
+    gpus = parse_csv(args.gpu_ids, int)
+    ports = parse_csv(args.worker_ports, int)
+    if len(gpus) != len(ports) or not gpus:
+        ap.error("--gpu-ids and --worker-ports must contain the same non-zero number of items")
+
+    for pid, _ in current_workers(ports):
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
     deadline = time.monotonic() + 90
-    while current_workers() and time.monotonic() < deadline:
+    while current_workers(ports) and time.monotonic() < deadline:
         time.sleep(1)
     (ROOT / "logs").mkdir(exist_ok=True)
     procs = []
-    for gpu, port, label in [(0, 8000, "parent"), (1, 8001, "retrieve")]:
+    labels = ["parent"] + [f"worker{i}" for i in range(1, len(gpus))]
+    for gpu, port, label in zip(gpus, ports, labels):
         argv = [
             f"{ENV}/bin/vllm", "serve", MODEL,
             "--served-model-name", "qwen3.5-4b", "--host", "0.0.0.0",
@@ -71,7 +94,7 @@ def main():
         print(f"started {label} pid={proc.pid} port={port}", flush=True)
     deadline = time.monotonic() + 600
     while time.monotonic() < deadline:
-        if all(health(port) for port in (8000, 8001)):
+        if all(health(port) for port in ports):
             print("connector_stack_ready", flush=True)
             return
         if any(proc.poll() is not None for proc in procs):

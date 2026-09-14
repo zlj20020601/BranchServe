@@ -4,16 +4,20 @@
 真实 Agent 流量的入口:标准 /v1/chat/completions 请求 + branchserve 元数据;
 router 维护会话注册表,轮询 worker 遥测(running+waiting),按三动作路由:
   PACK      child → parent 所在 worker,无 salt(本地 APC 命中)
-  RETRIEVE  child → 另一 worker,无 salt(lmcache 仓库取 KV)
-  RECOMPUTE child → 另一 worker,注入 per-session cache_salt(缓存键落空,真实重算)
+  RETRIEVE  child → 其他候选 worker 中压力最低者,无 salt(lmcache 仓库取 KV)
+  RECOMPUTE child → 其他候选 worker 中压力最低者,注入 per-session cache_salt(缓存键落空,真实重算)
 store 健康追踪:retrieve 派发后 transfer 计数不动 → 记 miss,连续 miss → 降级 RECOMPUTE。
 
 零第三方依赖(标准库)。决策逻辑为可替换函数(decide),阈值模式先行,
 成本模型模式预留(mode=cost_model)。
 
 用法:
-  python branchserve_service.py --port 9000 --worker0 http://127.0.0.1:8000 \
-      --worker1 http://127.0.0.1:8001 --threshold 5
+  python branchserve_service.py --port 9000 \
+      --worker http://127.0.0.1:8000 --worker http://127.0.0.1:8001 \
+      --worker http://127.0.0.1:8002 --threshold 5
+
+``--worker`` 可重复传入任意数量的 worker。旧的 ``--worker0/--worker1``
+参数仍保留，用于兼容双 worker 实验脚本。
 客户端示例(分支元数据放在 body 的 "branchserve" 字段,转发前剥离):
   {"model":"qwen3.5-4b","messages":[...],"branchserve":{"session_id":"s1"},
    ...}                                                       # parent
@@ -37,6 +41,7 @@ TRANSFER_RE = re.compile(
 
 STATE = {
     "workers": ["http://127.0.0.1:8000", "http://127.0.0.1:8001"],
+    "parent_worker": 0,
     "threshold": 5.0,
     "mode": "threshold",
     "start_ts": time.time(),
@@ -48,6 +53,7 @@ LOCK = threading.Lock()
 SESSIONS = {}          # session_id -> {"worker": idx, "prompt_tokens": n, "ts": ...}
 DECISIONS = []         # ring of last N decisions
 STORE = {"healthy": True, "misses": 0, "last_transfer": None}
+REMOTE_CURSOR = {}
 
 
 def register(session_id, worker_idx, prompt_tokens):
@@ -69,6 +75,23 @@ def log_decision(rec):
 
 # ---------------------------------------------------------------- telemetry
 TELEMETRY = {"ts": 0.0, "pressure": [0.0, 0.0], "transfer": [None, None]}
+
+
+def configure_workers(workers):
+    """Replace the worker pool and resize per-worker telemetry state."""
+    urls = [str(url).strip().rstrip("/") for url in workers if str(url).strip()]
+    if not urls:
+        raise ValueError("at least one worker is required")
+    with LOCK:
+        STATE["workers"] = urls
+        REMOTE_CURSOR.clear()
+        TELEMETRY["pressure"] = [0.0] * len(urls)
+        TELEMETRY["transfer"] = [None] * len(urls)
+        TELEMETRY["ts"] = 0.0
+
+
+def _remote_worker_indices(parent_worker_idx):
+    return [i for i in range(len(STATE["workers"])) if i != parent_worker_idx]
 
 
 def fetch_worker_metrics(url, timeout=15.0):
@@ -103,6 +126,10 @@ def telemetry_refresh(ttl=0.3):
     vals = [fetch_worker_metrics(w) for w in STATE["workers"]]
     with LOCK:
         TELEMETRY["ts"] = now
+        # Keep this robust for callers that configure STATE directly.
+        count = len(STATE["workers"])
+        TELEMETRY["pressure"] = (TELEMETRY["pressure"] + [0.0] * count)[:count]
+        TELEMETRY["transfer"] = (TELEMETRY["transfer"] + [None] * count)[:count]
         for i, (r, w, t) in enumerate(vals):
             if r is not None:
                 TELEMETRY["pressure"][i] = r + (w or 0.0)
@@ -126,7 +153,10 @@ def transfer_counter(worker_idx):
 def decide(parent_worker_idx, session_id):
     """三动作决策(可替换:threshold 模式先行,cost_model 模式预留)。"""
     pressure = pressure_of(parent_worker_idx)
-    if not STORE["healthy"]:
+    has_remote_worker = bool(_remote_worker_indices(parent_worker_idx))
+    if not has_remote_worker:
+        action = "pack"
+    elif not STORE["healthy"]:
         action = "recompute"
     elif pressure >= STATE["threshold"]:
         action = "retrieve"
@@ -137,12 +167,23 @@ def decide(parent_worker_idx, session_id):
 
 def apply_action(action, parent_worker_idx):
     """动作 → (目标 worker, cache_salt 或 None)。"""
-    other = 1 - parent_worker_idx
     if action == "pack":
         return parent_worker_idx, None
+    candidates = _remote_worker_indices(parent_worker_idx)
+    if not candidates:
+        # A one-worker deployment cannot retrieve or recompute remotely.
+        return parent_worker_idx, None
+    # Prefer the least pressured remote worker. Rotate only equal-pressure
+    # candidates so a burst does not pin every request to worker 1.
+    with LOCK:
+        min_pressure = min(TELEMETRY["pressure"][i] for i in candidates)
+        tied = [i for i in candidates if TELEMETRY["pressure"][i] == min_pressure]
+        cursor = REMOTE_CURSOR.get(parent_worker_idx, 0)
+        target = tied[cursor % len(tied)]
+        REMOTE_CURSOR[parent_worker_idx] = cursor + 1
     if action == "retrieve":
-        return other, None
-    return other, "bs-recompute"  # caller 附上 session 维度
+        return target, None
+    return target, "bs-recompute"  # caller 附上 session 维度
 
 
 # ---------------------------------------------------------------- forwarding
@@ -176,6 +217,7 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 self._send(200, {
                     "sessions": len(SESSIONS),
+                    "workers": list(STATE["workers"]),
                     "store": dict(STORE),
                     "pressure": list(TELEMETRY["pressure"]),
                     "decisions_recent": DECISIONS[-50:],
@@ -200,8 +242,10 @@ class Handler(BaseHTTPRequestHandler):
 
         parent_id = bs.get("parent_session_id")
         if parent_id is None:
-            # ---- parent 请求:固定 parent worker(与实验协议一致)
-            target_idx = 0
+            # ---- parent 请求:默认固定在 parent worker，保持会话亲和性。
+            target_idx = int(STATE.get("parent_worker", 0))
+            if target_idx < 0 or target_idx >= len(STATE["workers"]):
+                target_idx = 0
             try:
                 t0 = time.perf_counter()
                 resp = forward(target_idx, body)
@@ -267,12 +311,22 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=9000)
-    ap.add_argument("--worker0", default="http://127.0.0.1:8000")
-    ap.add_argument("--worker1", default="http://127.0.0.1:8001")
+    ap.add_argument(
+        "--worker", dest="worker_urls", action="append",
+        help="worker URL; repeat for each GPU (for example, --worker URL0 --worker URL1)",
+    )
+    ap.add_argument("--worker0", default="http://127.0.0.1:8000", help=argparse.SUPPRESS)
+    ap.add_argument("--worker1", default="http://127.0.0.1:8001", help=argparse.SUPPRESS)
+    ap.add_argument("--parent-worker", type=int, default=0,
+                    help="worker index used for parent sessions (default: 0)")
     ap.add_argument("--threshold", type=float, default=5.0)
     ap.add_argument("--mode", choices=["threshold", "cost_model"], default="threshold")
     args = ap.parse_args()
-    STATE["workers"] = [args.worker0, args.worker1]
+    workers = args.worker_urls or [args.worker0, args.worker1]
+    if args.parent_worker < 0 or args.parent_worker >= len(workers):
+        ap.error(f"--parent-worker must be between 0 and {len(workers) - 1}")
+    configure_workers(workers)
+    STATE["parent_worker"] = args.parent_worker
     STATE["threshold"] = args.threshold
     STATE["mode"] = args.mode
     telemetry_refresh(ttl=0)

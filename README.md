@@ -1,10 +1,10 @@
 # BranchServe
 
-双 GPU 长上下文 Agent fan-out 推理调度。当父请求已产生多个共享长上下文的子请求时,路由器在三个动作间选择:**PACK**(子请求留在 parent 所在 GPU,复用本地 Prefix Cache)、**RETRIEVE**(迁往另一 GPU 并通过共享存储携带 KV)、**RECOMPUTE**(迁往另一 GPU,空手重算共享上下文)。系统基于 vLLM 与 LMCache 构建:双 connector worker 与 lmcache server 常驻一套栈,三个动作零换栈可选(可部署口径);不修改模型或 vLLM 内核。
+多 GPU 长上下文 Agent fan-out 推理调度。当父请求已产生多个共享长上下文的子请求时,路由器在三个动作间选择:**PACK**(子请求留在 parent 所在 GPU,复用本地 Prefix Cache)、**RETRIEVE**(迁往候选 GPU 中压力较低的一张并通过共享存储携带 KV)、**RECOMPUTE**(迁往候选 GPU 中压力较低的一张,空手重算共享上下文)。系统基于 vLLM 与 LMCache 构建,worker 数量可按部署规模配置;不修改模型或 vLLM 内核。
 
 ## 主要结果
 
-测量条件:2×RTX 4090;Qwen3.5-4B(bf16,max_model_len 16384);双 vLLM worker(max_num_batched_tokens=1024)+ lmcache server(chunk 528,L1=100GB);4 轮追加式会话,共享前缀 8221→14359 tokens,每轮 parent 增量处理后 4 个 child 并发(各 256 输出 token);压力 = parent 卡上 N 个持续解码的背景请求(N=0/2/4/6/8),屏障保证派发时背景在位;派发策略为乐观派发(parent 返回即发 child)。除注明外每格 n=1,噪声带约 ±100ms。
+以下性能数据的测量条件是 2×RTX 4090;Qwen3.5-4B(bf16,max_model_len 16384);双 vLLM worker(max_num_batched_tokens=1024)+ lmcache server(chunk 528,L1=100GB);4 轮追加式会话,共享前缀 8221→14359 tokens,每轮 parent 增量处理后 4 个 child 并发(各 256 输出 token);压力 = parent 卡上 N 个持续解码的背景请求(N=0/2/4/6/8),屏障保证派发时背景在位;派发策略为乐观派发(parent 返回即发 child)。除注明外每格 n=1,噪声带约 ±100ms。这里的双卡是实验配置,不代表部署服务只能使用两张卡。
 
 child 组完成时间(child_makespan,4 轮均值,ms):
 
@@ -28,8 +28,8 @@ child 组完成时间(child_makespan,4 轮均值,ms):
 | 动作 | child 去向 | 机制 |
 |---|---|---|
 | PACK | parent 卡 | 本地 APC 命中,无跨卡流量 |
-| RETRIEVE | 另一卡 | 从 lmcache server 检索 parent 已存 KV |
-| RECOMPUTE | 另一卡(请求携带 cache_salt) | 缓存键落空,真实全量重算 |
+| RETRIEVE | 其他候选 GPU 中压力最低者 | 从 lmcache server 检索 parent 已存 KV |
+| RECOMPUTE | 其他候选 GPU 中压力最低者(请求携带 cache_salt) | 缓存键落空,真实全量重算 |
 
 RECOMPUTE 动作借用 vLLM 请求级 `cache_salt`(缓存盐)实现:cache_salt 参与本地 APC 与 lmcache 仓库的键计算,子请求携带与 parent 不同的 salt 即可让两级缓存查找都落空。lmcache 0.5.4 的仓库键包含 salt,已实测验证(带 salt 子请求 local_compute=8245、零 transfer;不带 salt 对照正常 transfer 7920)。固定每会话一个 salt 时,同 salt 组内及轮间共享重算成果(首轮首孩全量重算,其余子请求及后续轮命中),即"重算过的卡保持热"的可部署语义。
 
@@ -73,13 +73,13 @@ BranchServe/
 
 ## 项目背景
 
-BranchServe 面向双 GPU 长上下文 Agent fan-out 推理。一个 Parent 请求会派生多个共享长 prefix 的 Child 请求。系统需要在本地 Prefix Cache 复用和跨 GPU 并行之间选择执行位置。
+BranchServe 面向多 GPU 长上下文 Agent fan-out 推理。一个 Parent 请求会派生多个共享长 prefix 的 Child 请求。系统需要在本地 Prefix Cache 复用和跨 GPU 并行之间选择执行位置。
 
 ## 核心策略
 
 - **PACK**：Child 全部留在 Parent worker，复用本地 prefix cache。
-- **Retrieve**：Child 分到另一 worker，复用 Parent 已生成的 KV。
-- **Recompute**：Child 分到另一 worker，重新计算共享 prefix。
+- **Retrieve**：Child 分到其他候选 worker 中压力最低者，复用 Parent 已生成的 KV。
+- **Recompute**：Child 分到其他候选 worker 中压力最低者，重新计算共享 prefix。
 - **Dynamic**：根据 worker pressure 和 cache 状态在 PACK 与 Retrieve 等路径之间选择。
 
 LMCache 为长上下文提供 KV 保存、复用和跨 worker Retrieve 能力。实验区分 local cache hit、external KV transfer 和 recompute，不把缓存读取视为零成本。
@@ -116,7 +116,22 @@ Retrieve 比 PACK 快约 3.7%，比 Recompute 快约 32.7%。
 
 ## 当前结论与限制
 
-在当前双 GPU、长共享上下文和 fan-out 场景中，低压力优先 PACK，高压力优先 Retrieve，Recompute 通常最慢。Dynamic 已能根据 pressure 完成 PACK→Retrieve 切换；更长上下文下仍需继续完善跨轮 cache-ready 状态跟踪。当前结果不外推到任意模型、GPU 数量或 32K/64K 上下文。
+当前公开性能结果来自双 GPU、长共享上下文和 fan-out 场景：低压力优先 PACK，高压力优先 Retrieve，Recompute 通常最慢。部署服务已支持任意数量 worker，并能在多个候选 GPU 间按压力选择目标；尚未提供三卡及以上的性能数据，因此不应将双卡结果外推到更多 GPU、任意模型或 32K/64K 上下文。
+
+## 多 GPU 部署
+
+启动任意数量的 vLLM worker 时，为每张卡指定一个端口:
+
+```bash
+GPU_IDS=0,1,2 WORKER_PORTS=8000,8001,8002 \
+  python deployment/start_mooncake_connector_stack.py
+python deployment/branchserve_service.py --port 9000 \
+  --worker http://127.0.0.1:8000 \
+  --worker http://127.0.0.1:8001 \
+  --worker http://127.0.0.1:8002
+```
+
+第一个 worker 默认承载 Parent 会话;Child 在压力达到阈值时从其余 worker 中选择压力最低者。`--parent-worker N` 可调整 Parent 的默认落点,旧的 `--worker0/--worker1` 参数仍兼容双 worker 部署。
 
 ## 复现入口
 
@@ -171,7 +186,7 @@ python analyze_dynamic.py      # dynamic regret
 
 ## 已验证能力边界
 
-- 单机双 GPU、单模型(Qwen3.5-4B)、16K 上下文内的结论;多机、更大上下文、其他模型未测不声称。
+- 性能结论来自单机双 GPU、单模型(Qwen3.5-4B)、16K 上下文;部署代码支持多 worker,但三卡以上、多机、更大上下文和其他模型尚未实测。
 - Dynamic 为阈值规则(非学习型成本模型);成本模型重拟合使用本表数据(36ms/压力单位),未做跨负载泛化验证。
 
 ## 项目故事：为什么需要 BranchServe
@@ -182,7 +197,7 @@ python analyze_dynamic.py      # dynamic regret
 
 ```text
 留在 Parent 所在 GPU：可以复用本地 Prefix Cache，但多个 Child 会排队；
-迁移到另一张 GPU：可以并行执行，但需要 Retrieve KV，或者重新计算长 prefix。
+迁移到其他 GPU：可以并行执行，但需要 Retrieve KV，或者重新计算长 prefix。
 ```
 
 BranchServe 的问题不是“如何把请求平均分给 GPU”，而是：
@@ -193,7 +208,7 @@ BranchServe 的问题不是“如何把请求平均分给 GPU”，而是：
 
 - 共享 prefix 越长，重复 Recompute 越昂贵；
 - Parent worker 越繁忙，PACK 的排队成本越高；
-- 另一张 GPU 空闲且 KV 可用时，Retrieve 可以同时获得 prefix 复用和并行收益；
+- 其他 GPU 中有空闲且 KV 可用时，Retrieve 可以同时获得 prefix 复用和并行收益；
 - 因此最优策略可能随 pressure 变化，而不是固定不变。
 
 ## 系统如何工作
@@ -201,7 +216,7 @@ BranchServe 的问题不是“如何把请求平均分给 GPU”，而是：
 1. Parent 在一个 vLLM worker 上处理长上下文；
 2. LMCache 保存已经计算出的 KV；
 3. Parent 派生一组 Child，BranchServe Router 将整组 Child 作为一个调度单元；
-4. Router 读取两个 worker 的 running/waiting pressure 和 cache 状态；
+4. Router 读取 worker 池中各 worker 的 running/waiting pressure 和 cache 状态；
 5. Router 选择 PACK、Retrieve 或 Recompute；
 6. 所有 Child 完成后记录 group makespan、KV 来源和策略 regret。
 
